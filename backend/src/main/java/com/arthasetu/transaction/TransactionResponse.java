@@ -5,26 +5,27 @@ import java.time.LocalDateTime;
 
 public record TransactionResponse(
 
-                Long id,
+        Long id,
 
-                String referenceId,
+        String referenceId,
 
-                BigDecimal amount,
+        BigDecimal amount,
 
-                TransactionType type,
+        TransactionType type,
 
-                TransactionStatus status,
+        TransactionStatus status,
 
-                Integer riskScore,
+        Integer riskScore,
 
-                FraudRiskLevel riskLevel,
+        FraudRiskLevel riskLevel,
 
-                String sourceAccountNumber,
+        String sourceAccountNumber,
 
-                String destinationAccountNumber,
+        String destinationAccountNumber,
 
-                String description,
+        String description,
 
-                LocalDateTime createdAt) {
+        LocalDateTime createdAt
 
+) {
 }

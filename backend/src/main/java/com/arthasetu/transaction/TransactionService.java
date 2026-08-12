@@ -3,6 +3,7 @@ package com.arthasetu.transaction;
 import com.arthasetu.account.AccountStatus;
 import com.arthasetu.account.BankAccount;
 import com.arthasetu.account.BankAccountRepository;
+import com.arthasetu.fraud.FraudAlertService;
 import com.arthasetu.fraud.FraudAnalysisRequest;
 import com.arthasetu.fraud.FraudAnalysisResponse;
 import com.arthasetu.fraud.FraudDecision;
@@ -26,7 +27,9 @@ public class TransactionService {
         private final TransactionRepository transactionRepository;
         private final BankAccountRepository bankAccountRepository;
         private final UserRepository userRepository;
+
         private final FraudDetectionService fraudDetectionService;
+        private final FraudAlertService fraudAlertService;
 
         /**
          * Deposit money into the authenticated user's account.
@@ -56,6 +59,8 @@ public class TransactionService {
                                 .status(TransactionStatus.COMPLETED)
                                 .destinationAccount(account)
                                 .description(description)
+                                .riskScore(0)
+                                .riskLevel(FraudRiskLevel.LOW)
                                 .createdAt(LocalDateTime.now())
                                 .build();
 
@@ -95,6 +100,8 @@ public class TransactionService {
                                 .status(TransactionStatus.COMPLETED)
                                 .sourceAccount(account)
                                 .description(description)
+                                .riskScore(0)
+                                .riskLevel(FraudRiskLevel.LOW)
                                 .createdAt(LocalDateTime.now())
                                 .build();
 
@@ -102,8 +109,10 @@ public class TransactionService {
         }
 
         /**
-         * Transfer money between two bank accounts
-         * after fraud analysis.
+         * Transfer money from the authenticated user's account
+         * to another active account.
+         *
+         * Fraud detection is performed before the transfer is completed.
          */
         @Transactional
         public Transaction transfer(
@@ -121,10 +130,10 @@ public class TransactionService {
                                         "Source and destination accounts must be different");
                 }
 
-                // Get the authenticated user's source account.
+                // Get authenticated user's source account.
                 BankAccount sourceAccount = getUserAccount(email, sourceAccountNumber);
 
-                // Get the destination account.
+                // Get destination account.
                 BankAccount destinationAccount = bankAccountRepository
                                 .findByAccountNumber(destinationAccountNumber)
                                 .orElseThrow(() -> new IllegalArgumentException(
@@ -134,24 +143,19 @@ public class TransactionService {
                 validateActiveAccount(sourceAccount);
                 validateActiveAccount(destinationAccount);
 
-                // Check balance before fraud analysis.
+                // Check source account balance.
                 if (sourceAccount.getBalance().compareTo(amount) < 0) {
                         throw new IllegalArgumentException(
                                         "Insufficient account balance");
                 }
 
                 /*
-                 * ============================================
+                 * ---------------------------------------------------------
                  * FRAUD ANALYSIS
-                 * ============================================
+                 * ---------------------------------------------------------
                  *
-                 * Currently we have two real signals:
-                 *
-                 * 1. Transaction amount
-                 * 2. Current transaction hour
-                 *
-                 * The remaining fraud signals will be connected
-                 * to real database information later.
+                 * At this stage we use the signals currently available
+                 * in the transfer API.
                  */
                 FraudAnalysisRequest fraudRequest = new FraudAnalysisRequest(
                                 amount,
@@ -164,37 +168,51 @@ public class TransactionService {
                 FraudAnalysisResponse fraudResult = fraudDetectionService.analyze(fraudRequest);
 
                 /*
-                 * ============================================
-                 * FRAUD DECISION
-                 * ============================================
+                 * Convert fraud RiskLevel into transaction FraudRiskLevel.
                  */
+                FraudRiskLevel transactionRiskLevel = FraudRiskLevel.valueOf(
+                                fraudResult.getRiskLevel().name());
 
-                // CRITICAL → BLOCK
+                /*
+                 * ---------------------------------------------------------
+                 * CRITICAL FRAUD
+                 * ---------------------------------------------------------
+                 *
+                 * If the fraud engine decides to BLOCK the transaction,
+                 * do not move any money.
+                 */
                 if (fraudResult.getDecision() == FraudDecision.BLOCK) {
 
-                        throw new IllegalArgumentException(
-                                        "Transaction blocked by fraud detection. "
-                                                        + fraudResult.getReason());
-                }
+                        Transaction blockedTransaction = Transaction.builder()
+                                        .referenceId(generateReferenceId())
+                                        .amount(amount)
+                                        .type(TransactionType.TRANSFER)
+                                        .status(TransactionStatus.BLOCKED)
+                                        .sourceAccount(sourceAccount)
+                                        .destinationAccount(destinationAccount)
+                                        .riskScore(fraudResult.getRiskScore())
+                                        .riskLevel(transactionRiskLevel)
+                                        .description(
+                                                        buildFraudDescription(
+                                                                        description,
+                                                                        fraudResult))
+                                        .createdAt(LocalDateTime.now())
+                                        .build();
 
-                // HIGH → UNDER REVIEW
-                if (fraudResult.getDecision() == FraudDecision.UNDER_REVIEW) {
+                        Transaction savedTransaction = transactionRepository.save(blockedTransaction);
 
-                        throw new IllegalArgumentException(
-                                        "Transaction placed under fraud review. "
-                                                        + fraudResult.getReason());
+                        // Create fraud alert for the blocked transaction.
+                        fraudAlertService.createAlert(
+                                        savedTransaction,
+                                        fraudResult);
+
+                        return savedTransaction;
                 }
 
                 /*
-                 * LOW and MEDIUM transactions are allowed.
-                 *
-                 * LOW:
-                 * APPROVE
-                 *
-                 * MEDIUM:
-                 * APPROVE_AND_MONITOR
-                 *
-                 * Both currently proceed with the transfer.
+                 * ---------------------------------------------------------
+                 * NORMAL / MONITORED TRANSFER
+                 * ---------------------------------------------------------
                  */
 
                 // Remove money from source account.
@@ -209,28 +227,40 @@ public class TransactionService {
                 bankAccountRepository.save(sourceAccount);
                 bankAccountRepository.save(destinationAccount);
 
-                // Create transaction record.
+                /*
+                 * Build transaction.
+                 */
                 Transaction transaction = Transaction.builder()
                                 .referenceId(generateReferenceId())
                                 .amount(amount)
                                 .type(TransactionType.TRANSFER)
                                 .status(TransactionStatus.COMPLETED)
-                                .riskScore(fraudResult.getRiskScore())
-                                .riskLevel(
-                                                FraudRiskLevel.valueOf(
-                                                                fraudResult.getRiskLevel().name()))
                                 .sourceAccount(sourceAccount)
                                 .destinationAccount(destinationAccount)
+                                .riskScore(fraudResult.getRiskScore())
+                                .riskLevel(transactionRiskLevel)
                                 .description(
-                                                description
-                                                                + " | Fraud risk: "
-                                                                + fraudResult.getRiskLevel()
-                                                                + " | Score: "
-                                                                + fraudResult.getRiskScore())
+                                                buildFraudDescription(
+                                                                description,
+                                                                fraudResult))
                                 .createdAt(LocalDateTime.now())
                                 .build();
 
-                return transactionRepository.save(transaction);
+                Transaction savedTransaction = transactionRepository.save(transaction);
+
+                /*
+                 * Create fraud alert for MEDIUM and HIGH risk.
+                 *
+                 * LOW risk transactions do not create alerts.
+                 */
+                if (fraudResult.getRiskLevel() != com.arthasetu.fraud.RiskLevel.LOW) {
+
+                        fraudAlertService.createAlert(
+                                        savedTransaction,
+                                        fraudResult);
+                }
+
+                return savedTransaction;
         }
 
         /**
@@ -259,8 +289,8 @@ public class TransactionService {
         }
 
         /**
-         * Find an account and verify that it belongs
-         * to the authenticated user.
+         * Find an account and verify that it belongs to
+         * the authenticated user.
          */
         private BankAccount getUserAccount(
                         String email,
@@ -284,7 +314,7 @@ public class TransactionService {
         }
 
         /**
-         * Make sure the amount is valid.
+         * Validate transaction amount.
          */
         private void validateAmount(BigDecimal amount) {
 
@@ -314,6 +344,27 @@ public class TransactionService {
                         throw new IllegalArgumentException(
                                         "Bank account is not active");
                 }
+        }
+
+        /**
+         * Add fraud information to the transaction description.
+         */
+        private String buildFraudDescription(
+                        String description,
+                        FraudAnalysisResponse fraudResult) {
+
+                String baseDescription = description == null ? "" : description.trim();
+
+                String fraudDescription = "Fraud risk: "
+                                + fraudResult.getRiskLevel()
+                                + " | Score: "
+                                + fraudResult.getRiskScore();
+
+                if (baseDescription.isEmpty()) {
+                        return fraudDescription;
+                }
+
+                return baseDescription + " | " + fraudDescription;
         }
 
         /**
