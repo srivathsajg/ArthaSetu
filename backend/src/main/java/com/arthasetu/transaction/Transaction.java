@@ -53,6 +53,21 @@ public class Transaction {
     private TransactionStatus status = TransactionStatus.PENDING;
 
     /**
+     * Fraud risk score calculated for this transaction.
+     * Range: 0-100.
+     */
+    @Column(nullable = false)
+    @Builder.Default
+    private Integer riskScore = 0;
+
+    /**
+     * Fraud risk level calculated for this transaction.
+     */
+    @Enumerated(EnumType.STRING)
+    @Column(length = 20)
+    private FraudRiskLevel riskLevel;
+
+    /**
      * Account from which money is taken.
      *
      * For DEPOSIT transactions this can be null.

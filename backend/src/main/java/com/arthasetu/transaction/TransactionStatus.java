@@ -5,5 +5,7 @@ public enum TransactionStatus {
     PENDING,
     COMPLETED,
     FAILED,
-    BLOCKED
+    BLOCKED,
+    REVERSED,
+    UNDER_REVIEW
 }
